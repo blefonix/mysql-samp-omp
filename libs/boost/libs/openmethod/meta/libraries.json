@@ -1,0 +1,15 @@
+{
+    "key": "openmethod",
+    "name": "OpenMethod",
+    "authors": [
+        "Jean-Louis Leroy"
+    ],
+    "maintainers": [
+        "Jean-Louis Leroy"
+    ],
+    "description": "Open-methods are free-standing functions that work like virtual functions: they select the b​est overrider from a set, depending on the dynamic type of their arguments. This makes it possible to add polymorphic operations to existing classes, without modifying them. They make patterns like Visitor unnecessary.",
+    "category": [
+        "Emulation", "Programming"
+    ],
+    "cxxstd": "17"
+}

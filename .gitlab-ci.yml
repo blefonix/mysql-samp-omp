@@ -1,0 +1,203 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+stages:
+  - build
+  - test
+  - package
+  - release
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+  WINDOWS_RUNNER_TAG: ""
+
+.earthly_linux_job:
+  image:
+    name: earthly/earthly:v0.8.16
+    entrypoint: [""]
+  services:
+    - name: docker:27-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - earthly --version
+
+build_linux:
+  stage: build
+  extends: .earthly_linux_job
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - when: on_success
+  script:
+    - earthly --ci --output +linux-build --UBUNTU_VERSION=20.04
+  artifacts:
+    when: always
+    paths:
+      - dist/linux/mysql.so
+      - dist/linux/a_mysql.inc
+      - dist/linux/libmariadb.so.3
+    expire_in: 1 week
+
+build_linux_compat_22:
+  stage: build
+  extends: .earthly_linux_job
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - when: never
+  script:
+    - earthly --ci +linux-build --UBUNTU_VERSION=22.04
+
+build_windows:
+  stage: build
+  tags:
+    - $WINDOWS_RUNNER_TAG
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - if: '$WINDOWS_RUNNER_TAG == ""'
+      when: never
+    - when: on_success
+  script:
+    - '$ErrorActionPreference = "Stop"'
+    - 'cmake -S . -B build -G "Visual Studio 17 2022" -A Win32 -DBUILD_BUNDLED_MARIADB_CONNECTOR=ON'
+    - 'cmake --build build --config Release --parallel'
+  artifacts:
+    when: always
+    paths:
+      - build/src/Release/mysql.dll
+      - build/src/a_mysql.inc
+      - build/**/libmariadb.dll
+    expire_in: 1 week
+
+unit_tests_linux:
+  stage: test
+  image: ubuntu:22.04
+  variables:
+    DEBIAN_FRONTEND: noninteractive
+    TZ: Etc/UTC
+  services:
+    - name: mariadb:11
+      alias: mariadb
+      variables:
+        MARIADB_ROOT_PASSWORD: root
+        MARIADB_DATABASE: mysqlunittest
+        MARIADB_USER: mysqlunittest
+        MARIADB_PASSWORD: mysqlunittest
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - when: on_success
+  before_script:
+    - dpkg --add-architecture i386
+    - apt-get update
+    - apt-get install -y --no-install-recommends ca-certificates git cmake build-essential pkg-config binutils gcc-multilib g++-multilib libssl-dev:i386 mariadb-client jq curl unzip socat python3-pip
+    - python3 -m pip install --no-cache-dir cmake==3.31.6
+    - cmake --version
+    - test -f /usr/lib/i386-linux-gnu/libssl.so
+    - test -f /usr/lib/i386-linux-gnu/libcrypto.so
+  script:
+    - 'for i in $(seq 1 60); do mysqladmin ping -h mariadb -P 3306 -u mysqlunittest -pmysqlunittest --silent && break; sleep 2; done'
+    - 'socat TCP-LISTEN:3306,fork,reuseaddr,bind=127.0.0.1 TCP:mariadb:3306 >/tmp/socat-mariadb.log 2>&1 &'
+    - 'for i in $(seq 1 30); do mysqladmin ping -h 127.0.0.1 -P 3306 -u mysqlunittest -pmysqlunittest --silent && break; sleep 2; done'
+    - 'mysql -h 127.0.0.1 -P 3306 -u mysqlunittest -pmysqlunittest -D mysqlunittest -e "SELECT 1;"'
+    - cmake -S . -B build-ut -DCMAKE_BUILD_TYPE=Release -DFORCE_32_BIT=ON -DOPENSSL_SSL_LIBRARY=/usr/lib/i386-linux-gnu/libssl.so -DOPENSSL_CRYPTO_LIBRARY=/usr/lib/i386-linux-gnu/libcrypto.so -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    - cmake --build build-ut --parallel
+    - scripts/ci/check-linux-mysql-symbols.sh build-ut/src/mysql.so
+    - BUILD_DIR=build-ut DB_HOST=127.0.0.1 DB_USER=mysqlunittest DB_PASS=mysqlunittest DB_NAME=mysqlunittest WORK_DIR="$CI_PROJECT_DIR/unit-test-logs" UNIT_TEST_TIMEOUT=90s scripts/ci/run-openmp-unit-tests.sh
+  artifacts:
+    when: always
+    paths:
+      - unit-test-logs/*.log
+    expire_in: 1 week
+
+package_linux:
+  stage: package
+  extends: .earthly_linux_job
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - when: never
+  script:
+    - earthly --ci --output +linux-package --UBUNTU_VERSION=20.04
+  artifacts:
+    paths:
+      - dist/mysql-linux.tar.gz
+    expire_in: 1 year
+
+package_windows:
+  stage: package
+  tags:
+    - $WINDOWS_RUNNER_TAG
+  rules:
+    - if: '$CI_COMMIT_TAG && $WINDOWS_RUNNER_TAG != ""'
+    - when: never
+  script:
+    - '$ErrorActionPreference = "Stop"'
+    - 'cmake -S . -B build -G "Visual Studio 17 2022" -A Win32 -DBUILD_BUNDLED_MARIADB_CONNECTOR=ON'
+    - 'cmake --build build --config Release --parallel'
+    - 'cmake --build build --config Release --target package --parallel'
+    - '$pkg = Get-ChildItem build/*.zip | Select-Object -First 1'
+    - 'if (-not $pkg) { throw "No ZIP package found in build/" }'
+    - 'Add-Type -AssemblyName System.IO.Compression.FileSystem'
+    - '$zip = [System.IO.Compression.ZipFile]::OpenRead($pkg.FullName)'
+    - 'try { $entries = $zip.Entries | ForEach-Object { $_.FullName }; $hasMysqlDll = $entries | Where-Object { $_ -match "^[^/]+/components/mysql\.dll$" }; $hasMariaRootDll = $entries | Where-Object { $_ -match "^[^/]+/libmariadb\.dll$" }; if (-not $hasMysqlDll) { throw "Missing components/mysql.dll in package" }; if (-not $hasMariaRootDll) { throw "Missing root libmariadb.dll in package" } } finally { $zip.Dispose() }'
+    - 'New-Item -ItemType Directory -Force dist | Out-Null'
+    - 'Copy-Item $pkg.FullName dist/mysql-windows.zip'
+  artifacts:
+    paths:
+      - dist/mysql-windows.zip
+    expire_in: 1 year
+
+release_linux_only:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: package_linux
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_TAG && $WINDOWS_RUNNER_TAG == ""'
+    - when: never
+  script:
+    - echo "Creating GitLab release (Linux artifact)"
+  release:
+    tag_name: '$CI_COMMIT_TAG'
+    name: 'Release $CI_COMMIT_TAG'
+    description: 'Automated GitLab release generated by CI.'
+    assets:
+      links:
+        - name: Linux (x86) package
+          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/dist/mysql-linux.tar.gz?job=package_linux'
+
+release_with_windows:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: package_linux
+      artifacts: true
+    - job: package_windows
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_TAG && $WINDOWS_RUNNER_TAG != ""'
+    - when: never
+  script:
+    - echo "Creating GitLab release (Linux and Windows artifacts)"
+  release:
+    tag_name: '$CI_COMMIT_TAG'
+    name: 'Release $CI_COMMIT_TAG'
+    description: 'Automated GitLab release generated by CI.'
+    assets:
+      links:
+        - name: Linux (x86) package
+          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/dist/mysql-linux.tar.gz?job=package_linux'
+        - name: Windows (Win32) package
+          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/dist/mysql-windows.zip?job=package_windows'
