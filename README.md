@@ -180,3 +180,98 @@ If this variable is empty, GitLab CI builds/releases Linux only.
 ## Credits
 
 This project builds on the long work of the original SA-MP MySQL plugin contributors and maintainers.
+
+---
+
+# Blefonix Tools
+
+## B42 (Blefonix) MySQL Component Release Layout
+
+R - Knogle's fork (R42) of the official [SA-MP MySQL R41-4 plugin](https://github.com/pBlueG/SA-MP-MySQL).
+B - Blefonix's fork (B42) of Knogle's fork.
+
+This folder reproduces the **R42 Linux** release structure, but with binaries built locally from:
+- repo: `https://github.com/Knogle/SA-MP-MySQL`
+- branch: `open.mp`
+
+## Layout (matches R42 Linux package)
+
+- `components/mysql.so`
+- `libmariadb.so.3`
+- `pawno/include/a_mysql.inc`
+- `include/nonstd/string_view.hpp`
+- `include/nonstd/span.hpp`
+- `include/robin_hood.h`
+- `lib/cmake/string-view-lite/*`
+- `lib/cmake/span-lite/*`
+- `lib/cmake/robin_hood/*`
+- `LICENSE`
+
+## What was missing in a raw custom build (before B42 packaging)
+
+Compared to the `mysql-R42-Linux.tar.gz`, these items were missing from a plain `cmake --build` output and were added during B42 packaging:
+
+- `LICENSE`
+- `include/nonstd/string_view.hpp`
+- `include/nonstd/span.hpp`
+- `include/robin_hood.h`
+- `lib/cmake/string-view-lite/*`
+- `lib/cmake/span-lite/*`
+- `lib/cmake/robin_hood/*`
+
+Already present from the build output:
+
+- `components/mysql.so`
+- `libmariadb.so.3`
+- `pawno/include/a_mysql.inc`
+
+## Important installation notes (open.mp)
+
+Use **components**, not legacy SA-MP `plugins`.
+
+1. Copy `components/mysql.so` -> `<server_root>/components/mysql.so`
+2. Copy `libmariadb.so.3` -> `<server_root>/libmariadb.so.3`
+3. Copy `pawno/include/a_mysql.inc` -> your Pawn include path (usually `<server_root>/pawno/include/`)
+
+Note: open.mp uses a Pawn toolchain fork often referred to as **qawno**. If your local setup uses `qawno/include`, place `a_mysql.inc` there (or keep a synced copy).
+
+No `config.json` change is required for open.mp component loading.
+
+## Build notes used for this B42
+
+Host: Ubuntu 24.04, x86_64, producing **ELF32/i386** output.
+
+Build deps used:
+- `cmake`
+- `gcc-multilib`
+- `g++-multilib`
+- `libssl-dev:i386`
+
+Build commands:
+
+```bash
+cmake -S . -B build \
+ -DFORCE_32_BIT=ON \
+ -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+ -DOPENSSL_INCLUDE_DIR=/usr/include \
+ -DOPENSSL_CRYPTO_LIBRARY=/usr/lib/i386-linux-gnu/libcrypto.so \
+ -DOPENSSL_SSL_LIBRARY=/usr/lib/i386-linux-gnu/libssl.so
+
+cmake --build build --parallel
+```
+
+Why explicit OpenSSL paths: on this host, auto-detection picked incompatible/default paths for the bundled MariaDB Connector/C in 32-bit mode.
+
+## Optional packaging command
+
+From `tools/mysql` directory:
+
+```bash
+tar -czf mysql-B42-Linux.tar.gz -C B42 .
+```
+
+## Verification checklist
+
+- `readelf -h components/mysql.so` -> `Class: ELF32`, `Machine: Intel 80386`
+- `libmariadb.so.3` present in server root
+- server starts and mysql component loads without missing library errors
